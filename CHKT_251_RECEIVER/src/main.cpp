@@ -1,108 +1,141 @@
-#include <esp_now.h>
+/* Receiver (RX)
+   - Receives PRESS/RELEASE messages via ESP-NOW
+   - Controls 3 continuous MG995 servos by ramping PWM pulse width
+*/
+
+#include <Arduino.h>
+#include <ESP32Servo.h>
 #include <WiFi.h>
-#include <Adafruit_NeoPixel.h>
+#include <esp_now.h>
 #include <esp_wifi.h>
 
-#define LED_PIN 48
-#define LED_COUNT 1
+// ---------------------- CONFIG -----------------------
 #define CHANNEL 1
 
-Adafruit_NeoPixel strip(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
+// Servo GPIOs (servo0, servo1, servo2)
+int SERVO_PIN[3] = {1, 2, 3};
 
-const uint32_t colors[6] = {
-    strip.Color(255, 0, 0),   // Red
-    strip.Color(0, 255, 0),   // Green
-    strip.Color(0, 0, 255),   // Blue
-    strip.Color(255, 255, 0), // Yellow
-    strip.Color(255, 0, 255), // Magenta
-    strip.Color(0, 255, 255)  // Cyan
+// Per-servo adjustable max speed (PWM offset range)
+int maxSpeed[3] = {
+    40,   // servo 0 max speed
+    25,   // servo 1 max speed
+    60    // servo 2 max speed
 };
 
-unsigned long lastPacketTime = 0;
-const unsigned long TIMEOUT_MS = 1500;
+// Per-servo acceleration rate
+int accelRate[3] = {
+    2,    // servo 0 acceleration
+    1,    // servo 1 acceleration
+    3     // servo 2 acceleration
+};
+
+// Servo objects
+Servo servos[3];
+
+// Servo center and working PWM ranges
+const int SERVO_CENTER = 90;       // Neutral stop
+const int SERVO_MIN_PWM = 45;      // Full reverse limit
+const int SERVO_MAX_PWM = 135;     // Full forward limit
+
+// Current + target speeds
+int currentSpeed[3] = {0, 0, 0};    // -maxSpeed..+maxSpeed
+int targetSpeed[3]  = {0, 0, 0};
+
+// Heartbeat
+unsigned long lastPacket = 0;
+const unsigned long TIMEOUT_MS = 8000;
 bool lostConnection = false;
 
-void onDataReceived(const uint8_t *mac_addr, const uint8_t *data, int data_len)
+// Packet from transmitter
+struct CommandPacket {
+    uint8_t servo;
+    int8_t direction;  // -1, 0, +1
+};
+
+// ----------------- ESP-NOW CALLBACK ------------------
+void onReceive(const uint8_t *mac, const uint8_t *data, int len)
 {
-    lastPacketTime = millis();
+    lastPacket = millis();
     lostConnection = false;
 
-    if (data[0] == 0xFE)
-    {
-        // heartbeat, do nothing except update lastPacketTime
+    if (len != sizeof(CommandPacket)) return;
+
+    CommandPacket p;
+    memcpy(&p, data, sizeof(p));
+
+    if (p.servo == 255) {
+        // Heartbeat
         return;
     }
 
-    if (data_len != sizeof(uint8_t))
-    {
-        Serial.println("Invalid data length");
-        return;
-    }
+    if (p.servo < 3) {
+        // direction is -1, 0, +1
+        targetSpeed[p.servo] = p.direction * maxSpeed[p.servo];
 
-    uint8_t colorIndex = data[0];
-    if (colorIndex < 6)
-    {
-        strip.setPixelColor(0, colors[colorIndex]);
-        strip.show();
-        Serial.print("Changed color to index: ");
-        Serial.println(colorIndex);
-    }
-    else if (colorIndex == 0xFF)
-    {
-        strip.setPixelColor(0, 0); // Turn off
-        strip.show();
-        Serial.println("Turned off the LED");
+        Serial.printf("Servo %d -> Dir %d -> target %d\n",
+                      p.servo, p.direction, targetSpeed[p.servo]);
     }
 }
 
+// ---------------------- SETUP ------------------------
 void setup()
 {
     Serial.begin(115200);
-    delay(1000);
+    delay(500);
 
-    strip.begin();
-    strip.setBrightness(50);
-    strip.show();
+    // Setup servos
+    for (int i = 0; i < 3; i++) {
+        servos[i].setPeriodHertz(50);
+        servos[i].attach(SERVO_PIN[i], 500, 2500); // works best for MG995 continuous
+        servos[i].write(SERVO_CENTER);
+    }
 
     WiFi.mode(WIFI_STA);
     esp_wifi_set_channel(CHANNEL, WIFI_SECOND_CHAN_NONE);
-    WiFi.disconnect(); // Ensure we're not connected to any AP
+    WiFi.disconnect();
 
-    if (esp_now_init() != ESP_OK)
-    {
-        Serial.println("Error initializing ESP-NOW");
+    if (esp_now_init() != ESP_OK) {
+        Serial.println("ESP-NOW init failed");
         return;
     }
 
-    esp_now_register_recv_cb(onDataReceived);
+    esp_now_register_recv_cb(onReceive);
 
-    Serial.println("Initial MAC Address: " + WiFi.macAddress());
-    Serial.println("Initialization complete.");
+    lastPacket = millis();
+    Serial.println("Receiver ready");
 }
 
+// ---------------------- LOOP -------------------------
 void loop()
 {
     unsigned long now = millis();
 
-    if (!lostConnection && (now - lastPacketTime > TIMEOUT_MS))
-    {
+    // Connection timeout
+    if (!lostConnection && now - lastPacket > TIMEOUT_MS) {
         lostConnection = true;
-        Serial.println("Connection lost.");
+        Serial.println("Connection lost, stopping servos");
+        for (int i = 0; i < 3; i++) targetSpeed[i] = 0;
     }
 
-    if (lostConnection)
-    {
-        static unsigned long lastBlinkTime = 0;
-        static bool ledState = false;
+    // Smooth acceleration loop
+    for (int s = 0; s < 3; s++) {
 
-        if (now - lastBlinkTime >= 500)
-        {
-            lastBlinkTime = now;
-            ledState = !ledState;
-
-            strip.setPixelColor(0, ledState ? strip.Color(255, 0, 0) : 0); // Blink red
-            strip.show();
+        if (currentSpeed[s] < targetSpeed[s]) {
+            currentSpeed[s] += accelRate[s];
+            if (currentSpeed[s] > targetSpeed[s]) currentSpeed[s] = targetSpeed[s];
         }
+        else if (currentSpeed[s] > targetSpeed[s]) {
+            currentSpeed[s] -= accelRate[s];
+            if (currentSpeed[s] < targetSpeed[s]) currentSpeed[s] = targetSpeed[s];
+        }
+
+        // Convert speed (-max..max) → servo angle
+        int pwm = SERVO_CENTER + currentSpeed[s];
+
+        // Safety clamp
+        pwm = constrain(pwm, SERVO_MIN_PWM, SERVO_MAX_PWM);
+
+        servos[s].write(pwm);
     }
 
     delay(10);

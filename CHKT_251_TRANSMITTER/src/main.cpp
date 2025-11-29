@@ -1,148 +1,182 @@
+/* Transmitter (TX)
+   - Reads 6 buttons (active-low), sends PRESS/RELEASE messages via ESP-NOW
+   - Local NeoPixel indicator shows the same color when pressing
+   - Set RECEIVER_MAC to the receiver's MAC (6 bytes)
+*/
+
 #include <Arduino.h>
 #include <Adafruit_NeoPixel.h>
 #include <esp_now.h>
 #include <WiFi.h>
 #include <esp_wifi.h>
 
+// -------------------------------------------
+// CONFIG
+// -------------------------------------------
+
+// LED strip parameters
 #define LED_PIN 48
 #define LED_COUNT 1
+#define LED_BRIGHTNESS 30
+
+// WiFi channel
 #define CHANNEL 1
 
-const uint8_t RECEIVERMAC[] = {0x20, 0x6E, 0xF1, 0xB0, 0xF8, 0x34};
-
+// -------------------------------------------
+// GLOBALS
+// -------------------------------------------
 Adafruit_NeoPixel strip(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
 
-const int btnPins[6] = {4, 5, 6, 8, 9, 10};
-const uint32_t colors[6] = {
-	strip.Color(255, 0, 0),	  // Red
-	strip.Color(0, 255, 0),	  // Green
-	strip.Color(0, 0, 255),	  // Blue
-	strip.Color(255, 255, 0), // Yellow
-	strip.Color(255, 0, 255), // Magenta
-	strip.Color(0, 255, 255)  // Cyan
+// MAC address of the receiver
+const uint8_t RECEIVERMAC[] = {0x20, 0x6E, 0xF1, 0xB0, 0xF8, 0x34};
+
+// Packet definitions
+struct CommandPacket
+{
+	uint8_t servo;
+	int8_t direction; // +1 = clockwise, -1 = counterclockwise, 0 = stop
 };
 
+// Button mapping
+struct BtnMap
+{
+	uint8_t pin;
+	uint8_t servo;
+	int8_t direction;
+};
+
+BtnMap mapList[6] = {
+	{8, 0, -1},	 // Button on pin 8 controls servo 0 counterclockwise
+	{6, 0, +1},	 // Button on pin 6 controls servo 0 clockwise
+	{9, 1, -1},	 // Button on pin 9 controls servo 1 counterclockwise
+	{5, 1, +1},	 // Button on pin 5 controls servo 1 clockwise
+	{10, 2, -1}, // Button on pin 10 controls servo 2 counterclockwise
+	{4, 2, +1}	 // Button on pin 4 controls servo 2 clockwise
+};
+
+// LED mapping
+struct LedMap
+{
+	uint8_t pin;
+	uint32_t color;
+};
+
+LedMap ledList[6] = {
+	{8, strip.Color(255, 0, 0)},	// LED for button 0
+	{6, strip.Color(0, 255, 0)},	// LED for button 1
+	{9, strip.Color(0, 0, 255)},	// LED for button 2
+	{5, strip.Color(255, 255, 0)},	// LED for button 3
+	{10, strip.Color(255, 0, 255)}, // LED for button 4
+	{4, strip.Color(0, 255, 255)}	// LED for button 5
+};
+
+bool pressedState[6] = {false, false, false, false, false, false};
+unsigned long lastDebounce[6] = {0};
+
+const unsigned long DEBOUNCE_MS = 50UL;
 unsigned long lastHeartbeat = 0;
-void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status)
+const unsigned long HEARTBEAT_INTERVAL = 5000UL;
+
+
+// -------------------------------------------
+// SEND CALLBACK
+// -------------------------------------------
+void OnSent(const uint8_t *mac_addr, esp_now_send_status_t status)
 {
 	Serial.print("Last Packet Send Status: ");
 	Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Delivery Success" : "Delivery Fail");
 }
 
-void SetupEspNowPeer()
+void sendPacket(uint8_t servo, int8_t direction)
 {
-	esp_now_peer_info_t peerInfo = {};
-	memcpy(peerInfo.peer_addr, RECEIVERMAC, 6);
-	peerInfo.channel = CHANNEL;
-	peerInfo.encrypt = false;
+	CommandPacket p;
+	p.servo = servo;
+	p.direction = direction;
 
-	esp_now_del_peer(peerInfo.peer_addr);
-	if (esp_now_add_peer(&peerInfo) != ESP_OK)
-	{
-		Serial.println("Failed to add peer");
-		return;
-	}
-	else
-	{
-		Serial.println("Peer added successfully");
-	}
+	esp_now_send(RECEIVERMAC, (uint8_t *)&p, sizeof(p));
 }
 
+// -------------------------------------------
+// SETUP
+// -------------------------------------------
 void setup()
 {
 	Serial.begin(115200);
 	delay(1000);
 
 	strip.begin();
-	strip.setBrightness(50); // Set brightness to 50%
+	strip.setBrightness(LED_BRIGHTNESS);
 	strip.show();
 
 	for (int i = 0; i < 6; i++)
 	{
-		pinMode(btnPins[i], INPUT_PULLUP);
+		pinMode(mapList[i].pin, INPUT_PULLUP);
+		pressedState[i] = digitalRead(mapList[i].pin) == LOW;
+		lastDebounce[i] = millis();
 	}
 
 	WiFi.mode(WIFI_STA);
 	esp_wifi_set_channel(CHANNEL, WIFI_SECOND_CHAN_NONE);
+
+	WiFi.setSleep(true);
+	WiFi.setTxPower(WIFI_POWER_8_5dBm); // 8.5 dBm = 7 mW
 	WiFi.disconnect();
 
 	if (esp_now_init() != ESP_OK)
 	{
-		log("Error initializing ESP-NOW");
+		Serial.println("Error initializing ESP-NOW");
 		return;
 	}
 
-	esp_now_register_send_cb(OnDataSent);
-	SetupEspNowPeer();
+	esp_now_register_send_cb(OnSent);
 
-	Serial.println("Peer MAC Address: ");
-	for (int i = 0; i < 6; i++)
-	{
-		Serial.print(RECEIVERMAC[i], HEX);
-		if (i < 5)
-			Serial.print(":");
-	}
-	Serial.println();
+	esp_now_peer_info_t peer{};
+	memcpy(peer.peer_addr, RECEIVERMAC, 6);
+	peer.channel = CHANNEL;
+	peer.encrypt = false;
 
-	log("Initialization complete.");
+	esp_now_add_peer(&peer);
+
+	Serial.println("Initialization complete.");
 }
 
+// -------------------------------------------
+// LOOP
+// -------------------------------------------
 void loop()
 {
-	if (!peerConnected)
-	{
-		if (millis() - lastBlinkTime >= 500)
-		{
-			blinkState = !blinkState;
-			strip.setPixelColor(0, blinkState ? strip.Color(255, 0, 0) : strip.Color(0, 0, 0));
-			strip.show();
-			lastBlinkTime = millis();
-		}
-	}
-
-	bool anyButtonPressed = false;
+	unsigned long now = millis();
 
 	for (int i = 0; i < 6; i++)
 	{
-		if (digitalRead(btnPins[i]) == LOW)
+		bool pressed = digitalRead(mapList[i].pin) == LOW;
+		if (pressed != pressedState[i] && now - lastDebounce[i] > DEBOUNCE_MS)
 		{
-			anyButtonPressed = true;
+			pressedState[i] = pressed;
+			lastDebounce[i] = now;
 
-			if (peerConnected)
-			{
-				strip.setPixelColor(0, colors[i]);
-				strip.show();
-			}
-
-			log("Button IO" + String(btnPins[i]) + " pressed. Sending color index: " + String(i));
-
-			uint8_t buttonData = i;
-			esp_now_send(RECEIVERMAC, &buttonData, sizeof(buttonData));
-			delay(500); // Debounce delay
-			break;		// Only process one button at a time
-		}
-	}
-
-	// Send "off" command when no buttons are pressed
-	if (peerConnected && !anyButtonPressed)
-	{
-		static bool wasPressed = false;
-
-		if (wasPressed)
-		{
-			strip.setPixelColor(0, strip.Color(0, 0, 0));
+			// Update LED
+			strip.setPixelColor(0, pressed ? ledList[i].color : 0);
 			strip.show();
 
-			uint8_t offData = 6; // Send index 6 to turn off
-			esp_now_send(RECEIVERMAC, &offData, sizeof(offData));
-			log("All buttons released. Sending OFF command");
+			// Send command packet
+			CommandPacket p;
+			p.servo = mapList[i].servo;
+			p.direction = pressed ? mapList[i].direction : 0;
 
-			wasPressed = false;
+			esp_now_send(RECEIVERMAC, (uint8_t *)&p, sizeof(p));
+
+			Serial.printf("Btn %d -> servo %d dir %d\n", i, p.servo, p.direction);
 		}
 	}
-	else if (anyButtonPressed)
+
+	// Heartbeat every interval
+	if (now - lastHeartbeat > HEARTBEAT_INTERVAL)
 	{
-		static bool wasPressed = false;
-		wasPressed = true;
+		CommandPacket hb = {255, 0}; // Heartbeat packet
+		esp_now_send(RECEIVERMAC, (uint8_t *)&hb, sizeof(hb));
+		lastHeartbeat = now;
 	}
+
+	vTaskDelay(1);
 }

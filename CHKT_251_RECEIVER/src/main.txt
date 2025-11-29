@@ -1,0 +1,211 @@
+/* Receiver (RX)
+   - Receives PRESS/RELEASE messages via ESP-NOW
+   - Controls 3 continuous MG995 servos by ramping PWM pulse width
+   - Keeps LED color based on active presses
+   - Blinks LED if no packets for TIMEOUT_MS
+*/
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <esp_now.h>
+#include <esp_wifi.h>
+// #include <Adafruit_NeoPixel.h>
+
+// -------------------------------------------
+// CONFIG
+// -------------------------------------------
+
+// LED strip parameters
+// #define LED_PIN 48
+// #define LED_COUNT 1
+// #define LED_BRIGHTNESS 30
+
+// WiFi channel
+#define CHANNEL 1
+
+// SERVO pins
+const int SERVO_PIN[3] = {
+    1, // servo1 -> GPIO1
+    2, // servo2 -> GPIO2
+    3  // servo3 -> GPIO3
+};
+
+const int SERVO_CH[3] = {
+    0, // servo1 -> LEDC channel 0
+    1, // servo2 -> LEDC channel 1
+    2  // servo3 -> LEDC channel 2
+};
+
+// Adafruit_NeoPixel strip(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
+
+// Color mapping (index from TX)
+// uint32_t colors[6] = {
+//   strip.Color(255, 0, 0),
+//   strip.Color(0, 255, 0),
+//   strip.Color(0, 0, 255),
+//   strip.Color(255, 255, 0),
+//   strip.Color(255, 0, 255),
+//   strip.Color(0, 255, 255)
+// };
+
+// ==============================
+// CONTINUOUS SERVO PARAMETERS
+// ==============================
+const int US_STOP = 1500; // microseconds for stop
+const int US_MIN = 1000;  // microseconds for reverse max speed
+const int US_MAX = 2000;  // microseconds for max speed
+
+// max speed offset
+int MAX_SPEED = 300; // adjustable: 100–500 (bigger = faster)
+
+// float
+float accelRate = 0.08f; // acceleration rate
+
+float targetUs[3] = {1500.0f, 1500.0f, 1500.0f};
+float currentUs[3] = {1500.0f, 1500.0f, 1500.0f};
+
+// convert microseconds → duty (0–16383 for 14-bit)
+uint32_t usToDuty(int us)
+{
+    return (uint32_t)((float)us / 20000.0f * 16383.0f); // changed from 65535 to 16383
+}
+
+// ==============================
+// HEARTBEAT
+// ==============================
+
+unsigned long lastPacketTime = 0;
+bool lostConnection = false;
+#define TIMEOUT_MS 8000
+
+// ==============================
+// PACKET STRUCTURE
+// ==============================
+struct CommandPacket
+{
+    uint8_t servo;    // 0,1,2 for servos; 255 for heartbeat
+    int8_t direction; // -1,0,1
+};
+
+// ==============================
+// APPLY SERVO UPDATE
+// ==============================
+void updateServoTargets(uint8_t servo, int8_t dir)
+{
+    if (servo > 2)
+        return;
+
+    if (dir == 0)
+        targetUs[servo] = US_STOP;
+    else if (dir == +1)
+        targetUs[servo] = US_STOP + MAX_SPEED;
+    else if (dir == -1)
+        targetUs[servo] = US_STOP - MAX_SPEED;
+}
+
+// ==============================
+// PACKET RECEIVED
+// ==============================
+void onRecv(const uint8_t *mac_addr, const uint8_t *data, int data_len)
+{
+    lastPacketTime = millis();
+    lostConnection = false;
+
+    uint8_t v = data[0];
+
+    if (data_len != sizeof(CommandPacket))
+    {
+        Serial.println("Bad packet size");
+        return;
+    }
+
+    CommandPacket p;
+    memcpy(&p, data, sizeof(p));
+
+    Serial.printf("Received packet: servo=%d, direction=%d\n", p.servo, p.direction);
+
+    if (p.servo == 255)
+    {
+        // Heartbeat packet
+        // Serial.println("Heartbeat received");
+        return;
+    }
+
+    updateServoTargets(p.servo, p.direction);
+
+    // Update LED color based on active presses
+    // strip.setPixelColor(0, p.direction == 0 ? 0 : colors[p.servo * 2 + (p.direction == -1 ? 0 : 1)]);
+    // strip.show();
+}
+
+void setup()
+{
+    Serial.begin(115200);
+    delay(200);
+
+    // strip.begin();
+    // strip.setBrightness(LED_BRIGHTNESS);
+    // strip.show();
+
+    ledcSetup(SERVO_CH[0], 50, 14); // 50Hz, 14-bit resolution (was 16)
+    ledcSetup(SERVO_CH[1], 50, 14);
+    ledcSetup(SERVO_CH[2], 50, 14);
+
+    for (int i = 0; i < 3; i++)
+    {
+        ledcAttachPin(SERVO_PIN[i], SERVO_CH[i]);
+        ledcWrite(SERVO_CH[i], usToDuty(US_STOP));
+    }
+
+    WiFi.mode(WIFI_STA);
+    WiFi.setSleep(true);
+    esp_wifi_set_channel(CHANNEL, WIFI_SECOND_CHAN_NONE);
+    WiFi.disconnect();
+
+    if (esp_now_init() != ESP_OK)
+    {
+        Serial.println("Error initializing ESP-NOW");
+        return;
+    }
+
+    esp_now_register_recv_cb(onRecv);
+
+    lastPacketTime = millis(); // start timer
+
+    Serial.print("Initial MAC Address: ");
+    Serial.println(WiFi.macAddress());
+    Serial.println("Initialization complete.");
+}
+
+void loop()
+{
+    unsigned long now = millis();
+
+    // if (!lostConnection && (now - lastPacketTime > TIMEOUT_MS))
+    // {
+    //     lostConnection = true;
+    // }
+
+    // if (lostConnection)
+    // {
+    //     static unsigned long lastBlinkTime = 0;
+    //     static bool ledState = false;
+
+    //     if (now - lastBlinkTime >= 500)
+    //     {
+    //         lastBlinkTime = now;
+    //         ledState = !ledState;
+
+    //         strip.setPixelColor(0, ledState ? strip.Color(255, 255, 255) : 0); // Blink white
+    //         strip.show();
+    //     }
+    // }
+
+    // Smoothly update servo positions
+    for (int i = 0; i < 3; i++) {
+        currentUs[i] += (targetUs[i] - currentUs[i]) * accelRate;
+        ledcWrite(SERVO_CH[i], usToDuty((int)currentUs[i]));
+    }
+
+    delay(10);
+}
